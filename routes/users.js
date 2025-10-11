@@ -27,7 +27,7 @@ router.get('/', async (req, res) => {
     if (role) filter.role = role;
     if (plan) filter.plan = plan;
     if (isVerified !== undefined) filter.isVerified = isVerified === 'true';
-
+    if (role !== '') filter.role = { $ne: 'admin' };
     const users = await User.find(filter).select('-password').sort({ createdAt: -1 });
     res.json(users);
   } catch (error) {
