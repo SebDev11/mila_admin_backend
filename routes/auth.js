@@ -346,4 +346,298 @@ router.get('/pending-registrations', async (req, res) => {
   }
 });
 
+// @route   POST /api/auth/forgot-password
+// @desc    Request password reset
+// @access  Public
+router.post('/forgot-password', [
+  body('email')
+    .isEmail()
+    .normalizeEmail()
+    .withMessage('Must be a valid email address')
+], async (req, res) => {
+  try {
+    // Check for validation errors
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { email } = req.body;
+
+    // Find user by email
+    const user = await User.findOne({ email });
+    
+    // Always return success message to prevent email enumeration
+    // But only send email if user exists
+    if (!user) {
+      return res.json({
+        message: 'If an account exists with this email, you will receive a password reset link.'
+      });
+    }
+
+    // Generate reset token using crypto for better security
+    const crypto = require('crypto');
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+
+    // Set reset token and expiry (1 hour)
+    user.resetToken = hashedToken;
+    user.resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    await user.save();
+
+    // Send password reset email
+    const { sendPasswordResetEmail } = require('../utils/emailService');
+    const emailResult = await sendPasswordResetEmail(user, resetToken);
+
+    if (!emailResult.success) {
+      console.error('Failed to send password reset email:', emailResult.error);
+      // Continue even if email fails - token is still generated
+    }
+
+    res.json({
+      message: 'If an account exists with this email, you will receive a password reset link.'
+    });
+
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({
+      message: 'Server error processing request'
+    });
+  }
+});
+
+// @route   POST /api/auth/reset-password
+// @desc    Reset password using token
+// @access  Public
+router.post('/reset-password', [
+  body('token')
+    .trim()
+    .notEmpty()
+    .withMessage('Reset token is required'),
+  body('password')
+    .isLength({ min: 6 })
+    .withMessage('Password must be at least 6 characters long')
+], async (req, res) => {
+  try {
+    // Check for validation errors
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { token, password } = req.body;
+
+    // Hash the token to match stored version
+    const crypto = require('crypto');
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    // Find user with valid reset token
+    const user = await User.findOne({
+      resetToken: hashedToken,
+      resetTokenExpiry: { $gt: Date.now() }
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        message: 'Invalid or expired reset token'
+      });
+    }
+
+    // Update password and clear reset token
+    user.password = password;
+    user.resetToken = undefined;
+    user.resetTokenExpiry = undefined;
+    await user.save();
+
+    res.json({
+      message: 'Password has been reset successfully. You can now login with your new password.'
+    });
+
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({
+      message: 'Server error resetting password'
+    });
+  }
+});
+
+// @route   POST /api/auth/admin/generate-reset-token
+// @desc    Admin generates reset token for a user (without email)
+// @access  Private (admin only)
+router.post('/admin/generate-reset-token', [
+  body('userId')
+    .notEmpty()
+    .withMessage('User ID is required')
+], async (req, res) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ 
+        message: 'No token, authorization denied!'
+      });
+    }
+
+    // Verify admin token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const adminUser = await User.findById(decoded.userId);
+    
+    if (!adminUser || adminUser.role !== 'admin' || !adminUser.isVerified) {
+      return res.status(403).json({ 
+        message: 'Access denied. Admin privileges required.'
+      });
+    }
+
+    // Check for validation errors
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { userId } = req.body;
+
+    // Find target user
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({
+        message: 'User not found'
+      });
+    }
+
+    // Generate reset token
+    const crypto = require('crypto');
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+
+    // Set reset token and expiry (24 hours for admin-generated tokens)
+    user.resetToken = hashedToken;
+    user.resetTokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await user.save();
+
+    // Generate reset URL
+    const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const resetUrl = `${FRONTEND_URL}/reset-password?token=${resetToken}`;
+
+    // Log to console
+    console.log('\n' + '═'.repeat(60));
+    console.log('🔑 ADMIN GENERATED PASSWORD RESET');
+    console.log('═'.repeat(60));
+    console.log(`👤 Admin: ${adminUser.username} (${adminUser.email})`);
+    console.log(`🎯 Target User: ${user.username} (${user.email})`);
+    console.log(`📅 Generated: ${new Date().toLocaleString()}`);
+    console.log(`🔗 Reset URL: ${resetUrl}`);
+    console.log(`🔑 Reset Token: ${resetToken}`);
+    console.log(`⏰ Expires: ${new Date(Date.now() + 24 * 60 * 60 * 1000).toLocaleString()}`);
+    console.log('═'.repeat(60) + '\n');
+
+    res.json({
+      message: 'Reset token generated successfully',
+      resetUrl: resetUrl,
+      resetToken: resetToken,
+      expiresAt: user.resetTokenExpiry,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Generate reset token error:', error);
+    res.status(500).json({
+      message: 'Server error generating reset token'
+    });
+  }
+});
+
+// @route   POST /api/auth/admin/reset-user-password
+// @desc    Admin directly resets a user's password
+// @access  Private (admin only)
+router.post('/admin/reset-user-password', [
+  body('userId')
+    .notEmpty()
+    .withMessage('User ID is required'),
+  body('newPassword')
+    .isLength({ min: 6 })
+    .withMessage('Password must be at least 6 characters long')
+], async (req, res) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ 
+        message: 'No token, authorization denied!'
+      });
+    }
+
+    // Verify admin token
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const adminUser = await User.findById(decoded.userId);
+    
+    if (!adminUser || adminUser.role !== 'admin' || !adminUser.isVerified) {
+      return res.status(403).json({ 
+        message: 'Access denied. Admin privileges required.'
+      });
+    }
+
+    // Check for validation errors
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { userId, newPassword } = req.body;
+
+    // Find target user
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({
+        message: 'User not found'
+      });
+    }
+
+    // Update password and clear any existing reset tokens
+    user.password = newPassword;
+    user.resetToken = undefined;
+    user.resetTokenExpiry = undefined;
+    await user.save();
+
+    // Log to console
+    console.log('\n' + '═'.repeat(60));
+    console.log('🔐 ADMIN PASSWORD RESET');
+    console.log('═'.repeat(60));
+    console.log(`👤 Admin: ${adminUser.username} (${adminUser.email})`);
+    console.log(`🎯 Target User: ${user.username} (${user.email})`);
+    console.log(`📅 Reset Date: ${new Date().toLocaleString()}`);
+    console.log('═'.repeat(60) + '\n');
+
+    res.json({
+      message: 'Password has been reset successfully',
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Admin reset password error:', error);
+    res.status(500).json({
+      message: 'Server error resetting password'
+    });
+  }
+});
+
 module.exports = router;
